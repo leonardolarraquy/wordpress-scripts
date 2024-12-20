@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "CloudFormation Template to Deploy WordPress with RDS. Database is installed outside the instance"
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+  KeyName:
+    Description: Name of an existing EC2 KeyPair
+    Type: AWS::EC2::KeyPair::KeyName
+  DomainName:
+    Description: Route53 Domain Name (e.g., example.com)
+    Type: String
+  SubDomain:
+    Description: Subdomain to associate with the instance (e.g., www)
+    Type: String
+    Default: "www"
+  DBUsername:
+    Description: Username for the RDS database
+    Type: String
+    NoEcho: true
+  DBPassword:
+    Description: Password for the RDS database
+    Type: String
+    NoEcho: true
+
+Resources:
+  # VPC
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: WordPress-VPC
+
+  # Public Subnet A
+  MySubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: WordPress-Subnet-A
+
+  # Public Subnet B (for RDS)
+  MySubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: false # RDS should be in private subnets.
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: WordPress-Subnet-B
+
+  # Internet Gateway and Route Table for Public Access
+  MyInternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref MyInternetGateway
+
+  MyRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+  MyRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref MyRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref MyInternetGateway
+
+  SubnetRouteTableAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MySubnetA
+      RouteTableId: !Ref MyRouteTable
+
+  # Security Group for EC2 Instance and RDS Instance 
+  MySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP, HTTPS, and SSH access
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0 
+        - IpProtocol: tcp 
+          FromPort: 80 
+          ToPort: 80 
+          CidrIp: 0.0.0.0/0 
+        - IpProtocol: tcp 
+          FromPort: 443 
+          ToPort: 443 
+          CidrIp: 0.0.0.0/0 
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL access from EC2 instance 
+      VpcId: !Ref MyVPC 
+      SecurityGroupIngress:
+        - IpProtocol: tcp 
+          FromPort: 3306 
+          ToPort: 3306 
+          SourceSecurityGroupId : !Ref MySecurityGroup 
+
+  # DB Subnet Group for RDS 
+  MyDBSubnetGroup:
+    Type : AWS::RDS::DBSubnetGroup 
+    Properties : 
+      DBSubnetGroupDescription : Subnet group for RDS 
+      SubnetIds : 
+        - !Ref MySubnetB 
+        - !Ref MySubnetA 
+
+  # RDS Instance 
+  MyRDSInstance:
+    Type : AWS::RDS::DBInstance 
+    Properties : 
+      DBInstanceIdentifier : wordpress-db 
+      Engine : mysql 
+      EngineVersion : "8.0" 
+      DBInstanceClass : db.t4g.medium  
+      AllocatedStorage : "20"  
+      MasterUsername : !Ref DBUsername  
+      MasterUserPassword : !Ref DBPassword  
+      DBName : wordpress_db  
+      VPCSecurityGroups : 
+        - !Ref RDSSecurityGroup  
+      DBSubnetGroupName : !Ref MyDBSubnetGroup  
+      MultiAZ : false  
+      
+  # EC2 Instance for WordPress  
+  WordPressInstance :
+    Type : AWS::EC2::Instance  
+    Properties :
+      ImageId : ami-0c02fb55956c7d316 # AMI de Amazon Linux 2 (usualmente en us-east-1)  
+      InstanceType : !Ref InstanceType  
+      KeyName : !Ref KeyName  
+      SubnetId : !Ref MySubnetA  
+      SecurityGroupIds :
+        - !Ref MySecurityGroup  
+      Tags :
+        - Key : Name  
+          Value : WordPress-Instance  
+      UserData :
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo yum update -y  
+          sudo amazon-linux-extras enable php8.0  
+          sudo yum install -y php php-mysqlnd httpd mariadb-client wget  
+          sudo systemctl start httpd  
+          sudo systemctl enable httpd  
+
+          # Download WordPress  
+          cd /var/www/html  
+          wget https://wordpress.org/latest.tar.gz  
+          tar -xzf latest.tar.gz  
+          cp -r wordpress/* .  
+          sudo rm -rf wordpress latest.tar.gz  
+
+          sudo chown -R apache:apache /var/www/html  
+          sudo chmod -R 755 /var/www/html  
+
+          # Configure wp-config.php   
+          cp wp-config-sample.php wp-config.php   
+          sed -i "s/database_name_here/wordpress_db/" wp-config.php   
+          sed -i "s/username_here/${DBUsername}/" wp-config.php   
+          sed -i "s/password_here/${DBPassword}/" wp-config.php   
+          sed -i "s/localhost/${MyRDSInstance.Endpoint.Address}/" wp-config.php   
+
+          sudo systemctl restart httpd  
+
+  # Route53 Record for Domain Name   
+  MyDNSRecord :
+    Type : AWS::Route53::RecordSet   
+    Properties :
+      HostedZoneName : !Sub "${DomainName}."   
+      Name : !Sub "${SubDomain}.${DomainName}."   
+      Type : A   
+      TTL : '60'   
+      ResourceRecords :
+        - !GetAtt WordPressInstance.PublicIp   
+
+Outputs:
+   WebsiteURL :
+     Description : WordPress Website URL   
+     Value : !Sub "http://${SubDomain}.${DomainName}"   
+
+   RDSInstanceEndpoint :
+     Description : RDS Instance Endpoint   
+     Value : !GetAtt MyRDSInstance.Endpoint.Address   
