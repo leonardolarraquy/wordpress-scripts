@@ -1,0 +1,374 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation Template to Deploy WordPress with RDS, EFS, ALB, and Route53
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+
+  KeyName:
+    Description: Name of an existing EC2 KeyPair
+    Type: AWS::EC2::KeyPair::KeyName
+
+  DomainName:
+    Description: Route53 Domain Name (e.g., example.com)
+    Type: String
+
+  SubDomain:
+    Description: Subdomain to associate with the Load Balancer (e.g., www)
+    Type: String
+    Default: "www"
+
+  DBUsername:
+    Description: Username for the RDS database
+    Type: String
+    NoEcho: true
+
+  DBPassword:
+    Description: Password for the RDS database
+    Type: String
+    NoEcho: true
+
+  NumberOfInstances:
+    Description: Number of EC2 instances to launch
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 6
+
+  AvailabilityZones:
+    Description: Comma-separated list of Availability Zones (e.g., us-east-1a,us-east-1b)
+    Type: CommaDelimitedList
+
+  SSLCertificateARN:
+    Description: ARN of the SSL certificate for HTTPS (from AWS Certificate Manager)
+    Type: String
+
+Resources:
+  # VPC
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  # Subnets
+  MySubnets:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !Ref AvailabilityZones]
+      MapPublicIpOnLaunch: true
+
+  MySubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !Ref AvailabilityZones]
+      MapPublicIpOnLaunch: true
+
+  # Internet Gateway
+  MyInternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref MyInternetGateway
+
+  # Route Table for Public Subnets
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref MyInternetGateway
+
+  SubnetRouteTableAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MySubnets
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetRouteTableAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MySubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Group for EC2 and Load Balancer
+  MySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP, HTTPS, and SSH
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  # Security Group for RDS
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL access from EC2 instances
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref MySecurityGroup
+
+  # Security Group for EFS
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow NFS access
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref MySecurityGroup
+
+  # EFS File System
+  MyEFS:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      PerformanceMode: generalPurpose
+      Encrypted: true
+
+  MyMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref MyEFS
+      SubnetId: !Ref MySubnets
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  MyMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref MyEFS
+      SubnetId: !Ref MySubnetB
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  # RDS Database
+  MyRDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.t4g.medium
+      Engine: mysql
+      EngineVersion: "8.0"
+      MultiAZ: true
+      AllocatedStorage: 20
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBName: wordpressdb
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      DBSubnetGroupName: !Ref MyDBSubnetGroup
+
+  MyDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for RDS
+      SubnetIds:
+        - !Ref MySubnets
+        - !Ref MySubnetB
+
+  # Launch Template for EC2 Instances
+  WordPressLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: ami-0c02fb55956c7d316
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !Ref MySecurityGroup
+
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            amazon-linux-extras enable php8.0
+            yum install -y php php-mysqlnd httpd mysql wget amazon-efs-utils
+            systemctl start httpd
+            systemctl enable httpd
+
+            # Montar EFS
+            mkdir -p /var/www/html
+            sudo mount -t efs ${MyEFS}:/ /var/www/html
+            if [ $? -ne 0 ]; then
+              echo "EFS mount failed!" >> /var/log/efs_error.log
+              exit 1
+            fi
+            echo "${MyEFS}:/ /var/www/html efs defaults,_netdev 0 0" >> /etc/fstab
+
+            # Verificar archivo de bloqueo
+            if [ ! -f /var/www/html/.lock ]; then
+              # Crear archivo de bloqueo
+              touch /var/www/html/.lock
+
+              echo "Instancia configurando WordPress..." >> /var/log/wordpress_setup.log
+
+              # Configurar .htaccess para redirección HTTPS
+              echo '<IfModule mod_rewrite.c>' > /var/www/html/.htaccess
+              echo '  RewriteEngine On' >> /var/www/html/.htaccess
+              echo '  RewriteCond %{HTTPS} !=on' >> /var/www/html/.htaccess
+              echo '  RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]' >> /var/www/html/.htaccess
+              echo '</IfModule>' >> /var/www/html/.htaccess
+
+              # Instalar WordPress
+              echo "Instalando WordPress..."
+              cd /var/www/html
+              wget https://wordpress.org/latest.tar.gz
+              tar -xzf latest.tar.gz
+              cp -r wordpress/* .
+              rm -rf wordpress latest.tar.gz
+
+              # Configurar wp-config.php
+              cp wp-config-sample.php wp-config.php
+              sed -i "s/database_name_here/wordpressdb/" wp-config.php
+              sed -i "s/username_here/${DBUsername}/" wp-config.php
+              sed -i "s/password_here/${DBPassword}/" wp-config.php
+              sed -i "s/localhost/${MyRDSInstance.Endpoint.Address}/" wp-config.php
+
+              #insertar en la linea 20
+              sed -i "20a define('FORCE_SSL_ADMIN', true);\nif (strpos(\$_SERVER['HTTP_X_FORWARDED_PROTO'], 'https') !== false) {\n    \$_SERVER['HTTPS'] = 'on';\n}" wp-config.php
+
+              #insertar al final del script
+              sed -i "/\/\* That's all, stop editing! Happy publishing. \*\//i define('WP_HOME', 'https://${SubDomain}.${DomainName}');" /var/www/html/wp-config.php
+              sed -i "/\/\* That's all, stop editing! Happy publishing. \*\//i define('WP_SITEURL', 'https://${SubDomain}.${DomainName}');" /var/www/html/wp-config.php
+
+              echo "WordPress instalado correctamente." >> /var/log/wordpress_setup.log
+            else
+              echo "Archivo de bloqueo encontrado. Omite configuración de WordPress." >> /var/log/wordpress_setup.log
+            fi
+
+            # Ajustar permisos
+            sudo chown -R apache:apache /var/www/html
+            sudo chmod -R 755 /var/www/html
+
+            systemctl restart httpd
+
+  # Load Balancer
+  WordPressLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+        - !Ref MySubnets
+        - !Ref MySubnetB
+      SecurityGroups: [!Ref MySecurityGroup]
+      Scheme: internet-facing
+      Type: application
+
+  # Listener HTTPS (443)
+  WordPressListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WordPressLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref SSLCertificateARN
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WordPressTargetGroup
+
+  # Listener HTTP (80)
+  WordPressListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WordPressLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            StatusCode: HTTP_301
+
+  WordPressTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref MyVPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: "/wp-admin/install.php"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: true
+        - Key: stickiness.type
+          Value: app_cookie
+        - Key: stickiness.app_cookie.duration_seconds
+          Value: 86400
+        - Key: stickiness.app_cookie.cookie_name
+          Value: TESTCOOKIE
+
+  # Auto Scaling Group
+  WordPressAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref MySubnets
+        - !Ref MySubnetB
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WordPressLaunchTemplate
+        Version: !GetAtt WordPressLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref NumberOfInstances
+      MaxSize: !Ref NumberOfInstances
+      TargetGroupARNs:
+        - !Ref WordPressTargetGroup
+
+  # Route53 Record
+  MyDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Sub "${DomainName}."
+      Name: !Sub "${SubDomain}.${DomainName}."
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt WordPressLoadBalancer.DNSName
+        HostedZoneId: !GetAtt WordPressLoadBalancer.CanonicalHostedZoneID
+
+Outputs:
+  WebsiteURL:
+    Description: WordPress Website URL
+    Value: !Sub "https://${SubDomain}.${DomainName}"
+
+  LoadBalancerDNS:
+    Description: Load Balancer DNS
+    Value: !GetAtt WordPressLoadBalancer.DNSName
