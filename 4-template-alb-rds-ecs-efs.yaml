@@ -1,0 +1,713 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Deploy WordPress on AWS Fargate with a brand-new VPC, EFS, RDS, ALB,
+  Route53 record, and ECS auto scaling using the ECS service-linked role.
+  
+Parameters:
+  # ---------------------------------------
+  # Networking & Domain
+  # ---------------------------------------
+  DomainName:
+    Description: "Route53 Domain Name (e.g., example.com). Must already exist in Route53."
+    Type: String
+    Default: "leonardolarraquy.com.ar"
+
+  SubDomain:
+    Description: "Subdomain to associate with the ALB (e.g., demo)"
+    Type: String
+    Default: "demo"
+
+  AvailabilityZones:
+    Description: "List of at least two AZs (e.g. us-east-1a,us-east-1b)."
+    Type: CommaDelimitedList
+    Default: "us-east-1a,us-east-1b"
+
+  # ---------------------------------------
+  # RDS Settings
+  # ---------------------------------------
+  DBUsername:
+    Description: "Username for the RDS database"
+    Type: String
+    NoEcho: true
+    Default: "wpuser"
+
+  DBPassword:
+    Description: "Password for the RDS database"
+    Type: String
+    NoEcho: true
+    Default: "WP_Password123!"
+
+  # ---------------------------------------
+  # ECS / Fargate Settings
+  # ---------------------------------------
+  ECSCPU:
+    Description: "Fargate Task CPU units (256=0.25 vCPU, 512=0.5 vCPU, etc.)"
+    Type: Number
+    Default: 512
+
+  ECSMemory:
+    Description: "Fargate Task memory in MiB (e.g., 1024, 2048, 3072...)"
+    Type: Number
+    Default: 1024
+
+  DesiredCount:
+    Description: "Desired number of Fargate tasks"
+    Type: Number
+    Default: 1
+    MinValue: 1
+
+  MaxCount:
+    Description: "Max number of Fargate tasks when scaling out"
+    Type: Number
+    Default: 4
+
+  ScaleOutCPUThreshold:
+    Description: "Scale out if average CPU goes above this percent"
+    Type: Number
+    Default: 70
+
+  ScaleInCPUThreshold:
+    Description: "Scale in if average CPU goes below this percent"
+    Type: Number
+    Default: 30
+
+  # ---------------------------------------
+  # ALB / SSL
+  # ---------------------------------------
+  SSLCertificateARN:
+    Description: "ARN of the SSL certificate (from AWS Certificate Manager)"
+    Type: String
+    Default: "arn:aws:acm:us-east-1:417799411000:certificate/09ab86c9-1167-46fc-a94e-c1f1e8d6a11a"
+
+Resources:
+  # ==================================================================
+  # VPC & Networking
+  # ==================================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-VPC"
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [ 0, !Ref AvailabilityZones ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PublicSubnet1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [ 1, !Ref AvailabilityZones ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PublicSubnet2"
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [ 0, !Ref AvailabilityZones ]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PrivateSubnet1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [ 1, !Ref AvailabilityZones ]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PrivateSubnet2"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-IGW"
+
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PublicRouteTable"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachInternetGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  EIPNAT1:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: VPC
+
+  EIPNAT2:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: VPC
+
+  NATGateway1:
+    Type: AWS::EC2::NatGateway
+    DependsOn: PublicSubnet1RouteTableAssociation
+    Properties:
+      AllocationId: !GetAtt EIPNAT1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-NATGateway1"
+
+  NATGateway2:
+    Type: AWS::EC2::NatGateway
+    DependsOn: PublicSubnet2RouteTableAssociation
+    Properties:
+      AllocationId: !GetAtt EIPNAT2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-NATGateway2"
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PrivateRouteTable1"
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PrivateRouteTable2"
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    DependsOn: NATGateway1
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway1
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    DependsOn: NATGateway2
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway2
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  # ==================================================================
+  # Security Groups
+  # ==================================================================
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ALBSG"
+
+  ECSTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS Fargate Tasks
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ECSTaskSG"
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL from ECS Tasks
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref ECSTaskSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-RDSSG"
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow NFS from ECS Tasks
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref ECSTaskSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-EFSSG"
+
+  # ==================================================================
+  # EFS (Brand New)
+  # ==================================================================
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      PerformanceMode: generalPurpose
+      Encrypted: true
+
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref PrivateSubnet2
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  # ==================================================================
+  # RDS (MySQL) - Single AZ
+  # ==================================================================
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Subnet group for RDS"
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-RDSSubnetGroup"
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.t4g.medium
+      Engine: mysql
+      EngineVersion: "8.0"
+      AllocatedStorage: 20      StorageEncrypted: true
+      MultiAZ: false
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBName: wordpressdb
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+
+  # ==================================================================
+  # ECS (Fargate) + IAM Roles
+  # ==================================================================
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-MainCluster"
+
+  ECSExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ECSExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ECSTaskRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-wordpress"
+      RetentionInDays: 30
+
+  WordPressTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-WordPress"
+      Cpu: !Ref ECSCPU
+      Memory: !Ref ECSMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt ECSExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: wordpress
+          Image: "wordpress:latest"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+          Environment:
+            - Name: WORDPRESS_DB_HOST
+              Value: !GetAtt RDSInstance.Endpoint.Address
+            - Name: WORDPRESS_DB_USER
+              Value: !Ref DBUsername
+            - Name: WORDPRESS_DB_PASSWORD
+              Value: !Ref DBPassword
+            - Name: WORDPRESS_DB_NAME
+              Value: "wordpressdb"
+            - Name: WORDPRESS_CONFIG_EXTRA
+              Value: !Sub |
+                define('FORCE_SSL_ADMIN', true);
+                if (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && strpos($_SERVER['HTTP_X_FORWARDED_PROTO'], 'https') !== false) {
+                    $_SERVER['HTTPS'] = 'on';
+                }
+                define('WP_HOME','https://${SubDomain}.${DomainName}');
+                define('WP_SITEURL','https://${SubDomain}.${DomainName}');
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: "wordpress"
+          MountPoints:
+            - ContainerPath: /var/www/html
+              SourceVolume: wpcontent
+      Volumes:
+        - Name: wpcontent
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref EFSFileSystem
+            TransitEncryption: ENABLED
+
+  WordPressService:
+    Type: AWS::ECS::Service
+    DependsOn: WordPressListenerHTTPS
+    Properties:
+      Cluster: !Ref ECSCluster
+      ServiceName: !Sub "${AWS::StackName}-WordPressService"
+      TaskDefinition: !Ref WordPressTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref ECSTaskSecurityGroup
+      LoadBalancers:
+        - TargetGroupArn: !Ref WordPressTargetGroup
+          ContainerName: "wordpress"
+          ContainerPort: 80
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+
+  # ==================================================================
+  # Auto Scaling (Using the ECS service-linked role)
+  # ==================================================================
+  ECSServiceScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: WordPressService
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Join
+        - "/"
+        - - "service"
+          - !Ref ECSCluster
+          - !GetAtt WordPressService.Name
+      MinCapacity: 1
+      MaxCapacity: !Ref MaxCount
+
+  ECSServiceScaleOutPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    DependsOn: ECSServiceScalableTarget
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-ScaleOutPolicy"
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ECSServiceScalableTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        StepAdjustments:
+          - MetricIntervalLowerBound: 0
+            ScalingAdjustment: 1
+        Cooldown: 60
+
+  ECSServiceScaleInPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    DependsOn: ECSServiceScalableTarget
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-ScaleInPolicy"
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ECSServiceScalableTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        StepAdjustments:
+          - MetricIntervalUpperBound: 0
+            ScalingAdjustment: -1
+        Cooldown: 60
+
+  ScaleOutCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: ECSServiceScaleOutPolicy
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-ScaleOutCPUAlarm"
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 2
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Period: 60
+      Statistic: Average
+      Threshold: !Ref ScaleOutCPUThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+        - Name: ServiceName
+          Value: !GetAtt WordPressService.Name
+      AlarmActions:
+        - !Ref ECSServiceScaleOutPolicy
+
+  ScaleInCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: ECSServiceScaleInPolicy
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-ScaleInCPUAlarm"
+      ComparisonOperator: LessThanOrEqualToThreshold
+      EvaluationPeriods: 2
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Period: 60
+      Statistic: Average
+      Threshold: !Ref ScaleInCPUThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+        - Name: ServiceName
+          Value: !GetAtt WordPressService.Name
+      AlarmActions:
+        - !Ref ECSServiceScaleInPolicy
+
+  # ==================================================================
+  # ALB + Target Group + Listeners
+  # ==================================================================
+  WordPressLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-ALB"
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Scheme: internet-facing
+      Type: application
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ALB"
+
+  WordPressTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-TG"
+      VpcId: !Ref VPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: "/"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: "200-399"
+
+  WordPressListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WordPressLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref SSLCertificateARN
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WordPressTargetGroup
+
+  WordPressListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WordPressLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            StatusCode: HTTP_301
+
+  # ==================================================================
+  # Route53 DNS Record (Alias)
+  # ==================================================================
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Sub "${DomainName}."
+      Name: !Sub "${SubDomain}.${DomainName}."
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt WordPressLoadBalancer.DNSName
+        HostedZoneId: !GetAtt WordPressLoadBalancer.CanonicalHostedZoneID
+
+Outputs:
+  WordPressURL:
+    Description: "WordPress Website URL"
+    Value: !Sub "https://${SubDomain}.${DomainName}"
+
+  LoadBalancerDNSName:
+    Description: "ALB DNS Name"
+    Value: !GetAtt WordPressLoadBalancer.DNSName
+
+  RDSEndpoint:
+    Description: "RDS Endpoint"
+    Value: !GetAtt RDSInstance.Endpoint.Address
+
+  DBUsername:
+    Description: "RDS Database Username"
+    Value: !Ref DBUsername
+
+  DBPassword:
+    Description: "RDS Database Password (Sensitive)"
+    Value: !Ref DBPassword
+
+  VPCID:
+    Description: "VPC ID"
+    Value: !Ref VPC
+
+  PublicSubnet1ID:
+    Description: "Public Subnet 1 ID"
+    Value: !Ref PublicSubnet1
+
+  PublicSubnet2ID:
+    Description: "Public Subnet 2 ID"
+    Value: !Ref PublicSubnet2
+
+  PrivateSubnet1ID:
+    Description: "Private Subnet 1 ID"
+    Value: !Ref PrivateSubnet1
+
+  PrivateSubnet2ID:
+    Description: "Private Subnet 2 ID"
+    Value: !Ref PrivateSubnet2
+
+  InternetGatewayID:
+    Description: "Internet Gateway ID"
+    Value: !Ref InternetGateway
+
+  NATGateway1AllocationID:
+    Description: "NAT Gateway 1 Allocation ID"
+    Value: !GetAtt EIPNAT1.AllocationId
+
+  NATGateway2AllocationID:
+    Description: "NAT Gateway 2 Allocation ID"
+    Value: !GetAtt EIPNAT2.AllocationId
+
+  ECSClusterName:
+    Description: "ECS Cluster Name"
+    Value: !Ref ECSCluster
+
+  WordPressServiceName:
+    Description: "ECS WordPress Service Name"
+    Value: !GetAtt WordPressService.Name
+
+  EFSFileSystemID:
+    Description: "EFS File System ID"
+    Value: !Ref EFSFileSystem
+
+  EFSMountTarget1ID:
+    Description: "EFS Mount Target 1 ID"
+    Value: !Ref EFSMountTarget1
+
+  EFSMountTarget2ID:
+    Description: "EFS Mount Target 2 ID"
+    Value: !Ref EFSMountTarget2
